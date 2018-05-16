@@ -1292,7 +1292,6 @@ void HandleUploadDone()
     page += F("green'>" D_SUCCESSFUL "</font></b><br/>");
     page += FPSTR(HTTP_MSG_RSTRT);
     
-    // FIXME: Check this
     // No need to restart ESP8266 when flashing the RF
     if (upload_file_type != EFM8BB1_RF_FW_FILE) {
       restart_flag = 2;
@@ -1334,11 +1333,15 @@ void HandleUploadLoop()
       AriluxRfDisable();  // Prevent restart exception on Arilux Interrupt routine
 #endif  // USE_ARILUX_RF
       if (Settings.flag.mqtt_enabled) MqttDisconnect();
-      // uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-      // if (!Update.begin(maxSketchSpace)) {         //start with max available size
-      //   upload_error = 2;
-      //   return;
-      //}
+      uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+      if (!Update.begin(maxSketchSpace)) {         //start with max available size
+        if (_serialoutput) Update.printError(Serial);
+        if (Update.getError() == UPDATE_ERROR_BOOTSTRAP) {
+          if (_serialoutput) Serial.println("Device still in UART update mode, perform powercycle");
+        }
+        upload_error = 2;
+        return;
+      }
     }
     upload_progress_dot_count = 0;
   } else if (!upload_error && (UPLOAD_FILE_WRITE == upload.status)) {
@@ -1355,8 +1358,10 @@ void HandleUploadLoop()
         }
       } else {
         uint8_t err;
-        // Check if this is a RF bridge DW file
+        // Check if this is a RF bridge FW file
         if (upload.buf[0] == ':') {
+          // End current update session
+          Update.end();
 #ifdef USE_RF_FLASH
           upload_file_type = EFM8BB1_RF_FW_FILE;
           efm8bb1_update = (uint8_t *) malloc(EFM8BB1_MAX_SZ);
@@ -1399,7 +1404,6 @@ void HandleUploadLoop()
       }
     } else if (upload_file_type == EFM8BB1_RF_FW_FILE) {
 #ifdef USE_RF_FLASH
-      //FIXME: is totalSize ever != 0 at this point?
       if ((upload.totalSize > EFM8BB1_MAX_SZ) || (upload.currentSize > EFM8BB1_MAX_SZ)) {
         upload_error = 9;
         free(efm8bb1_update);
@@ -1411,7 +1415,7 @@ void HandleUploadLoop()
       efm8bb1_update += upload.currentSize;
 #endif
     
-    } else {  // firmware            
+    } else {  // firmware
       if (!upload_error && (Update.write(upload.buf, upload.currentSize) != upload.currentSize)) {
         upload_error = 5;
         return;
@@ -1444,21 +1448,28 @@ void HandleUploadLoop()
       pinMode(PIN_C2CK, OUTPUT);
       pinMode(PIN_C2D,  INPUT);
 
-      err = c2_programming_init();
-      if (err != C2_SUCCESS) {
-        upload_error = 10;
-        free(efm8bb1_update);
-        efm8bb1_update = NULL;
-        return;
-      }
+      for (int i = 0; i < 4; i++) {
+        err = c2_programming_init();
+        if (err != C2_SUCCESS) {
+          upload_error = 10;
+          free(efm8bb1_update);
+          efm8bb1_update = NULL;
+          return;
+        }
 
-      err = c2_device_erase();
-      Serial.printf("RF erase result: %s\n", c2_print_status_by_name(err));
-      if (err != C2_SUCCESS) {
-        upload_error = 11;
-        free(efm8bb1_update);
-        efm8bb1_update = NULL;
-        return;
+        err = c2_device_erase();
+        if (err != C2_SUCCESS) {
+          Serial.printf("RF erase result: %s\n", c2_print_status_by_name(err));
+          if (i < 3) {
+            // Reset RF chip and try again
+            c2_reset();
+          } else {
+            upload_error = 11;
+            free(efm8bb1_update);
+            efm8bb1_update = NULL;
+            return;
+          }
+        }
       }
 
       // Binary contains a set of commands, decode and program each one
